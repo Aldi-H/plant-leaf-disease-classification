@@ -1,0 +1,2 @@
+python-interpreter-path = "/home/kuro/miniconda3/envs/dicoding-submission/bin/python"
+ignore-missing-imports = ["*"]
