@@ -6,81 +6,35 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // SplitConfig holds the dataset splitting configuration.
 type SplitConfig struct {
-	// SourceDir is the root directory containing class subdirectories,
-	// e.g., "plantvillage dataset/segmented/"
 	SourceDir string
-
-	// OutputDir is where train/, validation/, test/ will be created,
-	// e.g., "plantvillage dataset/dataset-split/"
 	OutputDir string
-
-	// TestRatio is the fraction of data reserved for testing (first split).
-	// Default: 0.3 (30%)
 	TestRatio float64
-
-	// ValRatio is the fraction of the remaining train data reserved for validation (second split).
-	// Default: 0.2 (20% of the 70% → 14% overall)
-	ValRatio float64
-
-	// Seed for reproducible shuffling (matches random_state=42 in Python).
-	Seed int64
+	ValRatio  float64
+	Seed      int64
+	Workers   int
 }
 
-func printProgress(classIdx, totalClasses, filesDone, filesTotal int, className string, startTime time.Time) {
-	const barWidth = 20
-
-	var pct float64
-	if filesTotal > 0 {
-		pct = float64(filesDone) / float64(filesTotal) * 100
-	}
-
-	filled := int(float64(barWidth) * float64(filesDone) / float64(filesTotal))
-	if filled > barWidth {
-		filled = barWidth
-	}
-	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
-
-	elapsed := time.Since(startTime)
-	var eta time.Duration
-	var speed float64
-	if filesDone > 0 {
-		speed = float64(filesDone) / elapsed.Seconds()
-		remaining := filesTotal - filesDone
-		eta = time.Duration(float64(remaining)/speed) * time.Second
-	}
-
-	displayName := className
-	if len(displayName) > 15 {
-		displayName = displayName[:12] + "..."
-	}
-
-	fmt.Printf("\r\033[2K[%d/%d] %3.0f%% |%s| %d/%d [%s<%s, %.0f f/s] %s",
-		classIdx, totalClasses,
-		pct, bar, filesDone, filesTotal,
-		formatDuration(elapsed), formatDuration(eta), speed,
-		displayName)
-}
-
-func formatDuration(d time.Duration) string {
-	totalSec := int(d.Seconds())
-	min := totalSec / 60
-	sec := totalSec % 60
-	return fmt.Sprintf("%02d:%02d", min, sec)
+type copyJob struct {
+	src string
+	dst string
 }
 
 func main() {
 	if len(os.Args) < 3 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <source_dir> <output_dir> [seed]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s <source_dir> <output_dir> [seed] [workers]\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "\nExample:\n")
 		fmt.Fprintf(os.Stderr, "  %s './plantvillage dataset/segmented' './plantvillage dataset/dataset-split'\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "\nSplits dataset into train (56%%), validation (14%%), and test (30%%).\n")
+		fmt.Fprintf(os.Stderr, "\nSplits dataset into train (56%%), validation (14%%), and test (30%%) using a goroutine worker pool.\n")
 		os.Exit(1)
 	}
 
@@ -90,6 +44,7 @@ func main() {
 		TestRatio: 0.3,
 		ValRatio:  0.2,
 		Seed:      42,
+		Workers:   runtime.NumCPU() * 8,
 	}
 
 	if len(os.Args) >= 4 {
@@ -98,19 +53,24 @@ func main() {
 			cfg.Seed = seed
 		}
 	}
+	if len(os.Args) >= 5 {
+		var workers int
+		if _, err := fmt.Sscanf(os.Args[4], "%d", &workers); err == nil && workers > 0 {
+			cfg.Workers = workers
+		}
+	}
 
-	if err := splitDataset(cfg); err != nil {
+	if err := splitDatasetParallel(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func splitDataset(cfg SplitConfig) error {
+func splitDatasetParallel(cfg SplitConfig) error {
 	classNames, err := listSubdirs(cfg.SourceDir)
 	if err != nil {
 		return fmt.Errorf("reading source directory: %w", err)
 	}
-
 	if len(classNames) == 0 {
 		return fmt.Errorf("no class subdirectories found in %q", cfg.SourceDir)
 	}
@@ -119,31 +79,19 @@ func splitDataset(cfg SplitConfig) error {
 
 	rng := rand.New(rand.NewSource(cfg.Seed))
 
+	// Listing, shuffling, and directory creation are cheap and stay sequential;
+	// only the file copies (the actual bottleneck) get fanned out to workers.
+	var jobs []copyJob
 	totalTrain, totalVal, totalTest := 0, 0, 0
 
-	startTime := time.Now()
-	totalFiles := 0
-	copiedFiles := 0
-
 	for _, className := range classNames {
-		classDir := filepath.Join(cfg.SourceDir, className)
-		files, err := listFiles(classDir)
-		if err != nil {
-			return fmt.Errorf("listing files in %s: %w", classDir, err)
-		}
-		totalFiles += len(files)
-	}
-
-	for i, className := range classNames {
 		classDir := filepath.Join(cfg.SourceDir, className)
 
 		images, err := listFiles(classDir)
 		if err != nil {
 			return fmt.Errorf("listing files in %s: %w", classDir, err)
 		}
-
 		if len(images) == 0 {
-			printProgress(i+1, len(classNames), copiedFiles, totalFiles, className, startTime)
 			continue
 		}
 
@@ -151,12 +99,10 @@ func splitDataset(cfg SplitConfig) error {
 			images[i], images[j] = images[j], images[i]
 		})
 
-		// Split datasets into train and test with ratio 70:30
 		testCount := int(float64(len(images)) * cfg.TestRatio)
 		trainValImages := images[:len(images)-testCount]
 		testImages := images[len(images)-testCount:]
 
-		// Split datasets into train and validation (80:20 → 56:14 overall)
 		valCount := int(float64(len(trainValImages)) * cfg.ValRatio)
 		trainImages := trainValImages[:len(trainValImages)-valCount]
 		valImages := trainValImages[len(trainValImages)-valCount:]
@@ -172,28 +118,83 @@ func splitDataset(cfg SplitConfig) error {
 			if err := os.MkdirAll(destDir, 0o755); err != nil {
 				return fmt.Errorf("creating directory %s: %w", destDir, err)
 			}
-
 			for _, imgName := range splitImages {
-				src := filepath.Join(classDir, imgName)
-				dst := filepath.Join(destDir, imgName)
-				if err := copyFile(src, dst); err != nil {
-					return fmt.Errorf("copying %s → %s: %w", src, dst, err)
-				}
-				copiedFiles++
-
-				if copiedFiles%50 == 0 {
-					printProgress(i+1, len(classNames), copiedFiles, totalFiles, className, startTime)
-				}
+				jobs = append(jobs, copyJob{
+					src: filepath.Join(classDir, imgName),
+					dst: filepath.Join(destDir, imgName),
+				})
 			}
 		}
 
 		totalTrain += len(trainImages)
 		totalVal += len(valImages)
 		totalTest += len(testImages)
-
-		printProgress(i+1, len(classNames), copiedFiles, totalFiles, className, startTime)
 	}
+
+	totalFiles := len(jobs)
+	fmt.Printf("Copying %d files with %d worker goroutines...\n", totalFiles, cfg.Workers)
+
+	startTime := time.Now()
+	var copiedFiles int64
+
+	var errMu sync.Mutex
+	var copyErrors []string
+
+	jobCh := make(chan copyJob, cfg.Workers*4)
+
+	var workerWG sync.WaitGroup
+	for w := 0; w < cfg.Workers; w++ {
+		workerWG.Add(1)
+		go func() {
+			defer workerWG.Done()
+			for job := range jobCh {
+				if err := copyFile(job.src, job.dst); err != nil {
+					errMu.Lock()
+					copyErrors = append(copyErrors, fmt.Sprintf("%s -> %s: %v", job.src, job.dst, err))
+					errMu.Unlock()
+					continue
+				}
+				atomic.AddInt64(&copiedFiles, 1)
+			}
+		}()
+	}
+
+	stopProgress := make(chan struct{})
+	progressDone := make(chan struct{})
+	go func() {
+		defer close(progressDone)
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				printProgress(atomic.LoadInt64(&copiedFiles), int64(totalFiles), startTime)
+			case <-stopProgress:
+				return
+			}
+		}
+	}()
+
+	for _, job := range jobs {
+		jobCh <- job
+	}
+	close(jobCh)
+	workerWG.Wait()
+	close(stopProgress)
+	<-progressDone
+	printProgress(atomic.LoadInt64(&copiedFiles), int64(totalFiles), startTime)
 	fmt.Println()
+
+	if len(copyErrors) > 0 {
+		for i, e := range copyErrors {
+			if i >= 5 {
+				fmt.Fprintf(os.Stderr, "...and %d more errors\n", len(copyErrors)-5)
+				break
+			}
+			fmt.Fprintf(os.Stderr, "copy error: %s\n", e)
+		}
+		return fmt.Errorf("%d file(s) failed to copy", len(copyErrors))
+	}
 
 	fmt.Println(strings.Repeat("─", 60))
 	fmt.Printf("Summary:\n")
@@ -202,11 +203,50 @@ func splitDataset(cfg SplitConfig) error {
 	fmt.Printf("  Test:       %d images\n", totalTest)
 	fmt.Printf("  Total:      %d images\n", totalTrain+totalVal+totalTest)
 	fmt.Printf("  Output:     %s\n", cfg.OutputDir)
-
-	elapsed := time.Since(startTime)
-	fmt.Printf("  Elapsed:    %s\n", formatDuration(elapsed))
+	fmt.Printf("  Workers:    %d\n", cfg.Workers)
+	fmt.Printf("  Elapsed:    %s\n", formatDuration(time.Since(startTime)))
 
 	return nil
+}
+
+func printProgress(done, total int64, startTime time.Time) {
+	const barWidth = 30
+
+	var pct float64
+	if total > 0 {
+		pct = float64(done) / float64(total) * 100
+	}
+
+	filled := int(float64(barWidth) * float64(done) / float64(total))
+	if filled > barWidth {
+		filled = barWidth
+	}
+	if filled < 0 {
+		filled = 0
+	}
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+
+	elapsed := time.Since(startTime)
+	var eta time.Duration
+	var speed float64
+	if done > 0 {
+		speed = float64(done) / elapsed.Seconds()
+		remaining := total - done
+		if speed > 0 {
+			eta = time.Duration(float64(remaining)/speed) * time.Second
+		}
+	}
+
+	fmt.Printf("\r\033[2K%3.0f%% |%s| %d/%d [%s<%s, %.0f f/s]",
+		pct, bar, done, total,
+		formatDuration(elapsed), formatDuration(eta), speed)
+}
+
+func formatDuration(d time.Duration) string {
+	totalSec := int(d.Seconds())
+	min := totalSec / 60
+	sec := totalSec % 60
+	return fmt.Sprintf("%02d:%02d", min, sec)
 }
 
 func listSubdirs(dir string) ([]string, error) {
